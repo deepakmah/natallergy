@@ -30,6 +30,12 @@
             <artifactId>selenium-chrome-driver</artifactId>
             <version>4.32.0</version>
         </dependency>
+        <!-- Resolves/downloads chromedriver reliably when Selenium Manager hangs (proxy, Defender, OneDrive). -->
+        <dependency>
+            <groupId>io.github.bonigarcia</groupId>
+            <artifactId>webdrivermanager</artifactId>
+            <version>5.9.3</version>
+        </dependency>
     </dependencies>
     <build>
         <plugins>

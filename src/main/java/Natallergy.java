@@ -1,12 +1,15 @@
 import org.openqa.selenium.*;
 import org.openqa.selenium.chrome.ChromeDriver;
-import org.openqa.selenium.interactions.Actions;
+import org.openqa.selenium.chrome.ChromeOptions;
 import org.openqa.selenium.JavascriptExecutor;
+
+import io.github.bonigarcia.wdm.WebDriverManager;
 import org.openqa.selenium.support.ui.ExpectedConditions;
 import org.openqa.selenium.support.ui.Select;
 import org.openqa.selenium.support.ui.WebDriverWait;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.text.SimpleDateFormat;
@@ -14,16 +17,24 @@ import java.util.Base64;
 import java.util.Date;
 import java.time.Duration;
 import java.net.HttpURLConnection;
+import java.net.URI;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class Natallergy {
 
-   
+
 
     static String IMGBB_API_KEY = "3b23b07a37fbcee41d4984d100162a10";
     static String RUN_DATE = new SimpleDateFormat("yyyy-MM-dd").format(new Date());
@@ -38,15 +49,67 @@ public class Natallergy {
     static String HTML_DIR = "C:\\Users\\deepa\\Documents\\Automation\\Natallergy\\html\\" + RUN_DATE + "\\" + RUN_TIME;
     static String CSV_PATH = "C:\\Users\\deepa\\Documents\\Automation\\Natallergy\\Natallergy.csv";
 
+    /** Storefront used for browsing, checkout, and rewriting sitemap &lt;loc&gt; hosts when they differ (e.g. multi-store). */
+    static final String SITE_BASE = "https://www.natlallergy.com";
+
+    private static final String SITEMAP_URL = SITE_BASE + "/sitemap.xml";
+    private static final Pattern SITEMAP_LOC_PATTERN = Pattern.compile("<loc>\\s*([^<]+?)\\s*</loc>", Pattern.CASE_INSENSITIVE);
+    /** Cap how many sitemap product pages we open while filling the cart (avoids an endless run). */
+    private static final int MAX_SITEMAP_PRODUCT_TRIES = 50;
+    private static final Duration ADD_TO_CART_STOCK_WAIT = Duration.ofSeconds(28);
+    /** Before checkout, add this many distinct random in-stock products (inclusive range). */
+    private static final int MIN_PRODUCTS_BEFORE_CHECKOUT = 3;
+    private static final int MAX_PRODUCTS_BEFORE_CHECKOUT = 4;
+
+    /**
+     * Builds a visible Chrome session. Uses WebDriverManager so driver download/version resolution does not rely on
+     * Selenium Manager alone (often hangs behind corporate networks, Defender, or OneDrive-synced projects).
+     * {@code --remote-allow-origins=*} avoids Chrome 111+ CDP handshake stalls with some Selenium pairings.
+     */
+    private static WebDriver createChromeDriver() {
+        ChromeOptions options = new ChromeOptions();
+        options.addArguments("--start-maximized");
+        options.addArguments("--window-position=0,0");
+        options.addArguments("--disable-search-engine-choice-screen");
+        options.addArguments("--remote-allow-origins=*");
+
+        String manualDriver = System.getProperty("webdriver.chrome.driver");
+        if (manualDriver != null && !manualDriver.isBlank()) {
+            System.out.println("[Natallergy] Using chromedriver from -Dwebdriver.chrome.driver=" + manualDriver);
+        } else {
+            System.out.println("[Natallergy] Resolving ChromeDriver (WebDriverManager; first run may download driver)…");
+            System.out.flush();
+            WebDriverManager.chromedriver().setup();
+        }
+        System.out.flush();
+
+        System.out.println("[Natallergy] Launching Chrome window…");
+        System.out.flush();
+        return new ChromeDriver(options);
+    }
+
     public static void main(String[] args) throws IOException, InterruptedException {
 
-        WebDriver driver = new ChromeDriver();
-        driver.manage().window().maximize();
-        driver.get("https://www.natlallergy.com/");
-        waitForPageFullyLoaded(driver);
-        takeScreenshot(driver, "homepage");
-        product(driver);
-        driver.quit();
+        WebDriver driver = createChromeDriver();
+        try {
+            driver.manage().window().maximize();
+            System.out.println("[Natallergy] Chrome should be visible. Loading storefront: " + SITE_BASE + "/");
+            driver.get(SITE_BASE + "/");
+            waitForPageFullyLoaded(driver);
+
+            System.out.println("[Natallergy] Downloading & parsing sitemap.xml (often 30–120 s, ~1 MB). "
+                    + "The browser may sit on the homepage until this finishes — this is normal.");
+            List<String> productUrls = discoverProductUrlsFromSitemap();
+            if (productUrls.isEmpty()) {
+                throw new IllegalStateException("No product URLs matched filters from " + SITEMAP_URL);
+            }
+            System.out.println("[Natallergy] Sitemap ready: " + productUrls.size() + " product URLs. Capturing homepage screenshot…");
+
+            takeScreenshot(driver, "homepage");
+            product(driver, args, productUrls);
+        } finally {
+            driver.quit();
+        }
     }
 
     private static void safeClick(WebDriver driver, WebElement element) {
@@ -212,32 +275,364 @@ public class Natallergy {
         fillTextInput(driver, el, value);
     }
 
-    private static void product(WebDriver driver) throws IOException, InterruptedException {
-        WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(15));
-        WebElement categoryLabel = wait.until(ExpectedConditions.visibilityOfElementLocated(
-                By.xpath("//span[normalize-space()=\"Find Relief From\"]")));
-        new Actions(driver).moveToElement(categoryLabel).perform();
-        wait.until(ExpectedConditions.visibilityOfElementLocated(
-                By.cssSelector("li.nav-1 ul.level0.submenu")));
+    /** Fetches XML and returns every {@code <loc>} value (sitemap index or urlset). */
+    private static List<String> extractSitemapLocs(String xml) {
+        List<String> out = new ArrayList<>();
+        Matcher m = SITEMAP_LOC_PATTERN.matcher(xml);
+        while (m.find()) {
+            String loc = m.group(1).trim();
+            if (!loc.isEmpty()) {
+                out.add(loc);
+            }
+        }
+        return out;
+    }
 
-        safeClick(driver, wait, By.xpath("//a[@id='ui-id-4']//span[contains(text(),'Dust Mites')]"));
+    private static String fetchHttpText(String urlString) throws IOException {
+        URL url = new URL(urlString);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(60_000);
+        conn.setReadTimeout(120_000);
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (compatible; NatallergyAutomation/1.0)");
+        conn.setInstanceFollowRedirects(true);
+        int code = conn.getResponseCode();
+        if (code >= 400) {
+            throw new IOException("HTTP " + code + " for " + urlString);
+        }
+        try (InputStream in = conn.getInputStream()) {
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
+
+    /**
+     * If the sitemap lists another storefront host (common on multi-store Magento), rewrite path/query to {@link #SITE_BASE}
+     * so the session stays on the site under test.
+     */
+    private static String rewriteLocHostToSiteBase(String loc) {
+        try {
+            URI u = URI.create(loc.trim());
+            URI base = URI.create(SITE_BASE);
+            if (u.getHost() != null && u.getHost().equalsIgnoreCase(base.getHost())) {
+                return loc.trim();
+            }
+            String path = u.getRawPath();
+            if (path == null || path.isEmpty()) {
+                path = "/";
+            }
+            String q = u.getRawQuery();
+            String frag = u.getRawFragment();
+            StringBuilder sb = new StringBuilder();
+            sb.append(base.getScheme()).append("://").append(base.getHost());
+            if (base.getPort() != -1) {
+                sb.append(":").append(base.getPort());
+            }
+            sb.append(path);
+            if (q != null) {
+                sb.append("?").append(q);
+            }
+            if (frag != null) {
+                sb.append("#").append(frag);
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return loc.trim();
+        }
+    }
+
+    /**
+     * Recursively collects leaf page URLs: follows child {@code .xml} entries (sitemap index), otherwise adds all {@code loc}s.
+     */
+    private static void collectSitemapLeafUrls(String sitemapUrl, int depth, Set<String> leafUrls) throws IOException {
+        if (depth > 12) {
+            return;
+        }
+        String xml = fetchHttpText(sitemapUrl);
+        List<String> locs = extractSitemapLocs(xml);
+        boolean hasChildXml = false;
+        for (String loc : locs) {
+            if (loc.toLowerCase().endsWith(".xml")) {
+                hasChildXml = true;
+                break;
+            }
+        }
+        if (hasChildXml) {
+            for (String loc : locs) {
+                if (loc.toLowerCase().endsWith(".xml")) {
+                    collectSitemapLeafUrls(loc, depth + 1, leafUrls);
+                }
+            }
+        } else {
+            for (String loc : locs) {
+                leafUrls.add(rewriteLocHostToSiteBase(loc));
+            }
+        }
+    }
+
+    /** URLs that look like catalog product detail pages (not categories, cart, or account). */
+    private static boolean isCatalogProductPage(String url) {
+        try {
+            URI u = URI.create(url);
+            if (u.getHost() == null) {
+                return false;
+            }
+            String siteHost = URI.create(SITE_BASE).getHost();
+            if (siteHost != null && !u.getHost().equalsIgnoreCase(siteHost)) {
+                return false;
+            }
+            String path = u.getPath();
+            if (path == null || path.isEmpty() || "/".equals(path)) {
+                return false;
+            }
+            String lower = url.toLowerCase();
+            int q = lower.indexOf('?');
+            String pathLower = q >= 0 ? lower.substring(0, q) : lower;
+            if (pathLower.contains("/customer/")
+                    || pathLower.contains("/checkout")
+                    || pathLower.contains("/cart")
+                    || pathLower.contains("/catalogsearch/")
+                    || pathLower.contains("/wishlist")) {
+                return false;
+            }
+            if (pathLower.contains("/catalog/category/")) {
+                return false;
+            }
+            if (pathLower.endsWith(".html")) {
+                return true;
+            }
+            return pathLower.contains("/catalog/product/view/");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static List<String> discoverProductUrlsFromSitemap() throws IOException {
+        Set<String> leaf = new LinkedHashSet<>();
+        collectSitemapLeafUrls(SITEMAP_URL, 0, leaf);
+        List<String> products = new ArrayList<>();
+        for (String u : leaf) {
+            if (isCatalogProductPage(u)) {
+                products.add(u);
+            }
+        }
+        return products;
+    }
+
+    /** {@code args[0]} parsed as {@link Random} seed for shuffling sitemap order; otherwise a random seed. */
+    private static Random shuffleRngFromArgs(String[] args) {
+        if (args != null && args.length > 0 && args[0] != null && !args[0].isBlank()) {
+            try {
+                return new Random(Long.parseLong(args[0].trim()));
+            } catch (NumberFormatException ignored) {
+                // use random seed below
+            }
+        }
+        return new Random(ThreadLocalRandom.current().nextLong());
+    }
+
+    private static boolean hasExplicitOutOfStockIndicators(WebDriver driver) {
+        By[] selectors = new By[]{
+                By.cssSelector(".stock.unavailable"),
+                By.cssSelector(".availability.out-of-stock"),
+                By.cssSelector(".product-info-stock-sku .stock.unavailable"),
+                By.cssSelector("#product-options-wrapper .stock.unavailable"),
+                By.cssSelector(".product.alert.stock"),
+        };
+        for (By by : selectors) {
+            for (WebElement el : driver.findElements(by)) {
+                try {
+                    if (el.isDisplayed()) {
+                        return true;
+                    }
+                } catch (StaleElementReferenceException ignored) {
+                    // continue
+                }
+            }
+        }
+        for (WebElement el : driver.findElements(By.cssSelector("[itemprop='availability']"))) {
+            try {
+                if (!el.isDisplayed()) {
+                    continue;
+                }
+                String href = el.getAttribute("href");
+                if (href != null && href.toLowerCase().contains("outofstock")) {
+                    return true;
+                }
+            } catch (StaleElementReferenceException ignored) {
+                // continue
+            }
+        }
+        return false;
+    }
+
+    private static boolean isAddToCartButtonEnabled(WebDriver driver) {
+        List<WebElement> buttons = driver.findElements(By.id("product-addtocart-button"));
+        if (buttons.isEmpty()) {
+            return false;
+        }
+        WebElement b = buttons.get(0);
+        try {
+            if (!b.isDisplayed()) {
+                return false;
+            }
+        } catch (StaleElementReferenceException e) {
+            return false;
+        }
+        if (b.getAttribute("disabled") != null) {
+            return false;
+        }
+        if ("true".equalsIgnoreCase(b.getAttribute("aria-disabled"))) {
+            return false;
+        }
+        String cls = b.getAttribute("class");
+        return cls == null || !cls.contains("disabled");
+    }
+
+    /**
+     * After options are chosen, waits for either a salable add-to-cart control or a clear OOS state (Magento).
+     * @return true if add to cart can be used; false if clearly OOS or button never becomes enabled in time
+     */
+    private static boolean waitForInStockAddToCartOrGiveUp(WebDriver driver) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + ADD_TO_CART_STOCK_WAIT.toMillis();
+        while (System.currentTimeMillis() < deadline) {
+            if (hasExplicitOutOfStockIndicators(driver)) {
+                return false;
+            }
+            if (isAddToCartButtonEnabled(driver)) {
+                return true;
+            }
+            Thread.sleep(350);
+        }
+        if (hasExplicitOutOfStockIndicators(driver)) {
+            return false;
+        }
+        return isAddToCartButtonEnabled(driver);
+    }
+
+    private static String urlSlugForScreenshots(String productUrl) {
+        try {
+            String path = URI.create(productUrl).getPath();
+            if (path == null || path.isEmpty()) {
+                return "product";
+            }
+            String last = path.substring(path.lastIndexOf('/') + 1);
+            if (last.endsWith(".html")) {
+                last = last.substring(0, last.length() - 5);
+            }
+            last = last.replaceAll("[^a-zA-Z0-9_-]+", "_");
+            if (last.isEmpty()) {
+                return "product";
+            }
+            return last.length() > 60 ? last.substring(0, 60) : last;
+        } catch (Exception e) {
+            return "product";
+        }
+    }
+
+    /**
+     * Chooses the first real option on each visible configurable-attribute {@code select} (Magento), re-querying after AJAX.
+     */
+    private static void selectConfigurableOptionsIfPresent(WebDriver driver, WebDriverWait wait) throws InterruptedException {
+        for (int round = 0; round < 8; round++) {
+            List<WebElement> selects = driver.findElements(By.cssSelector(
+                    "select[id^='attribute'], select.super-attribute-select, #product-options-wrapper select"));
+            int acted = 0;
+            for (WebElement selEl : selects) {
+                try {
+                    if (!selEl.isDisplayed()) {
+                        continue;
+                    }
+                    Select s = new Select(selEl);
+                    String current = s.getFirstSelectedOption().getAttribute("value");
+                    if (current != null && !current.isEmpty() && !"0".equals(current)) {
+                        continue;
+                    }
+                    for (WebElement o : s.getOptions()) {
+                        String v = o.getAttribute("value");
+                        if (v != null && !v.isEmpty() && !"0".equals(v)) {
+                            s.selectByValue(v);
+                            acted++;
+                            waitForPageFullyLoaded(driver);
+                            Thread.sleep(400);
+                            break;
+                        }
+                    }
+                } catch (StaleElementReferenceException | NoSuchElementException ignored) {
+                    // next round refreshes the list
+                }
+            }
+            if (acted == 0) {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Opens a product URL, selects options, and adds to cart when salable. Does not navigate away on success.
+     * @return true if add-to-cart was clicked after a salable state
+     */
+    private static boolean visitProductAndAddToCartIfSalable(WebDriver driver, WebDriverWait wait, String candidate,
+            int visitOrdinal) throws IOException, InterruptedException {
+        driver.get(candidate);
         waitForPageFullyLoaded(driver);
-        ((JavascriptExecutor) driver).executeScript("window.scrollBy(0, 400);");
-        takeScreenshot(driver, "dust_mites_category");
+        takeScreenshot(driver, "sitemap_product_visit" + visitOrdinal + "_" + urlSlugForScreenshots(candidate));
 
-        safeClick(driver, wait,
-                By.xpath("//a[normalize-space()=\"All-Cotton Allergy Mattress Covers\"]"));
-        waitForPageFullyLoaded(driver);
-        takeScreenshot(driver, "all_cotton_allergy_mattress_covers_product");
+        selectConfigurableOptionsIfPresent(driver, wait);
 
-        WebElement sizeSelectEl = wait.until(ExpectedConditions.elementToBeClickable(
-                By.xpath("//select[@id=\"attribute216\"]")));
-        safeClick(driver, sizeSelectEl);
-        new Select(sizeSelectEl).selectByValue("877");
+        if (!waitForInStockAddToCartOrGiveUp(driver)) {
+            System.out.println("Skipping (out of stock or add to cart unavailable): " + candidate);
+            takeScreenshot(driver, "sitemap_product_oos_" + urlSlugForScreenshots(candidate), false,
+                    "Out of stock or add to cart stayed disabled — trying next sitemap product");
+            return false;
+        }
 
         safeClick(driver, wait, By.xpath("//button[@id=\"product-addtocart-button\"]"));
+        System.out.println("Added to cart: " + candidate);
+        Thread.sleep(1500);
+        takeScreenshot(driver, "after_add_line_" + visitOrdinal + "_" + urlSlugForScreenshots(candidate));
+        return true;
+    }
+
+    private static void product(WebDriver driver, String[] args, List<String> productUrls) throws IOException, InterruptedException {
+        WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(15));
+
+        int targetLines = ThreadLocalRandom.current().nextInt(MIN_PRODUCTS_BEFORE_CHECKOUT, MAX_PRODUCTS_BEFORE_CHECKOUT + 1);
+        List<Integer> order = new ArrayList<>(productUrls.size());
+        for (int i = 0; i < productUrls.size(); i++) {
+            order.add(i);
+        }
+        Collections.shuffle(order, shuffleRngFromArgs(args));
+
+        Set<String> addedUrls = new LinkedHashSet<>();
+        int maxVisits = Math.min(productUrls.size(), MAX_SITEMAP_PRODUCT_TRIES);
+        int visitCount = 0;
+
+        System.out.println("Sitemap products found: " + productUrls.size()
+                + " — adding " + targetLines + " random distinct in-stock product(s), up to " + maxVisits + " page visits");
+
+        for (int listPos : order) {
+            if (addedUrls.size() >= targetLines) {
+                break;
+            }
+            if (visitCount >= maxVisits) {
+                break;
+            }
+            String candidate = productUrls.get(listPos);
+            if (addedUrls.contains(candidate)) {
+                continue;
+            }
+            visitCount++;
+            if (visitProductAndAddToCartIfSalable(driver, wait, candidate, visitCount)) {
+                addedUrls.add(candidate);
+            }
+        }
+
+        if (addedUrls.size() < targetLines) {
+            throw new IllegalStateException("Added only " + addedUrls.size() + " of " + targetLines
+                    + " distinct products after " + visitCount + " sitemap visits (cap " + maxVisits + ")");
+        }
+
         ((JavascriptExecutor) driver).executeScript("window.scrollTo(0, 0);");
-        Thread.sleep(3000);
+        Thread.sleep(2000);
         takeScreenshot(driver, "after_add_to_cart_top");
 
         safeClick(driver, wait, By.xpath("//a[@class=\"action showcart\"]"));
